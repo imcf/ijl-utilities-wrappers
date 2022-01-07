@@ -17,13 +17,13 @@ public class Cellpose {
 
 
     //static String defaultExePath = "C:/Users/username/.conda/envs/cellpose";
-    static String defaultEnvDirPath = "C:/Users/username/.conda/envs/cellpose";//"E:/conda-envs/CellPoseGPU3";
+    static String defaultEnvDirPath = "cellpose";//"C:/Users/username/.conda/envs/cellpose"; ///Users/username/opt/anaconda3/envs/cellpose
     static String defaultEnvType    = "conda";
     static boolean defaultUseGpu    = true;
     static boolean defaultUseMxnet  = false;
     static boolean defaultUseFastMode = false;
     static boolean defaultUseResample = false;
-    static String defaultVersion = "0.6";
+    static String defaultVersion = "0.7";
 
     public static String envDirPath = Prefs.get(keyPrefix+"envDirPath", defaultEnvDirPath);
     public static String envType = Prefs.get(keyPrefix+"envType", defaultEnvType);
@@ -48,6 +48,7 @@ public class Cellpose {
 
     static void execute(List<String> options, Consumer<InputStream> outputHandler)  throws IOException, InterruptedException {
         List<String> cmd = new ArrayList<>();
+        List<String> terminal_cmd = new ArrayList<>();
 
         // Get the prefs about the env type
         String envType = Prefs.get(keyPrefix+"envType", Cellpose.envType);
@@ -57,13 +58,19 @@ public class Cellpose {
             List<String> conda_activate_cmd = null;
 
             if (  IJ.isWindows()) {
-                conda_activate_cmd = Arrays.asList("cmd.exe", "/C", "conda", "activate", envDirPath);
+                conda_activate_cmd = Arrays.asList("conda", "activate", envDirPath);
+                cmd.addAll(conda_activate_cmd);
+                // After starting the env we can now use cellpose
+                cmd.add("&");// to have a second line
+
             } else if ( IJ.isLinux() || IJ.isMacOSX() ){
                 // https://docs.conda.io/projects/conda/en/4.6.1/user-guide/tasks/manage-environments.html#id2
-                // conda_activate_cmd = Arrays.asList("bash", "-c", "conda", "source","activate", envDirPath);
-                throw new UnsupportedOperationException("Linux and MacOS not supported yet");
+
+                conda_activate_cmd = Arrays.asList("source", "activate", "cellpose");
+                cmd.addAll(conda_activate_cmd);
+                cmd.add(";");
+                //throw new UnsupportedOperationException("Linux and MacOS not supported yet");
             }
-            cmd.addAll(conda_activate_cmd);
 
         } else if (envType.equals("venv")) { // venv
             List<String> venv_activate_cmd = Arrays.asList("cmd.exe", "/C", new File(envDirPath, "Scripts/activate").toString());
@@ -72,18 +79,27 @@ public class Cellpose {
             System.out.println("Virtual env type unrecognized!");
         }
 
-        // After starting the env we can now use cellpose
-        cmd.add("&");// to have a second line
         List<String> cellpose_args_cmd = Arrays.asList("python", "-m", "cellpose");
         cmd.addAll(cellpose_args_cmd);
 
         // input options
         cmd.addAll(options);
+
+        if (  IJ.isWindows()) {
+            terminal_cmd = Arrays.asList("cmd.exe", "/C");
+            terminal_cmd.addAll(cmd);
+        } else if ( IJ.isLinux() || IJ.isMacOSX() ){
+
+            terminal_cmd.addAll( Arrays.asList("bash", "-c") );
+            String cmdString = cmd.toString().replace(","," ");
+            System.out.println( cmdString );
+            terminal_cmd.add( cmdString.substring(1, cmdString.length()-1));
+        }
         //
-        System.out.println( cmd );
+        System.out.println( terminal_cmd );
 
         // Now the cmd line is ready
-        ProcessBuilder pb = new ProcessBuilder(cmd);
+        ProcessBuilder pb = new ProcessBuilder(terminal_cmd);
         pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
         //pb.redirectOutput(NULL_FILE);
         pb.redirectError(ProcessBuilder.Redirect.INHERIT);
