@@ -1278,127 +1278,121 @@ def get_auto_blocksize(
     This calculation separates RAM limits (for the 3D volume stitching/flows)
     and VRAM limits (for slice-wise GPU processing).
     """
+    # Get available system memory (8GB fallback if psutil unavailable)
     try:
         import psutil
 
         available_ram = psutil.virtual_memory().available
     except Exception:
-        available_ram = 8 * 1024**3  # Fallback 8GB
+        available_ram = 8 * 1024**3
 
-    # 1. RAM constraint (Total Volume)
-    # Target 70% of available RAM for the block (it's the only worker on its GPU usually)
+    # Calculate RAM constraint for total volume storage
+    # Target 70% of available RAM, accounting for input+results copies (6x for 3D, 3x for 2D)
     ram_limit = available_ram * 0.7
-    # For host RAM, we mainly care about the input + results. 6-8 copies is enough.
     ram_multiplier = multiplier if multiplier > 0 else (6.0 if is_3d else 3.0)
     target_voxels_ram = ram_limit / (4 * ram_multiplier)
 
-    # 2. VRAM constraint (Individual Plane + 3D Post-processing)
-    # Target usage: be very conservative with small GPUs
+    # Calculate VRAM constraint for GPU processing
     vram_total = 0
     if use_gpu and torch is not None and torch.cuda.is_available():
         vram_total = torch.cuda.get_device_properties(0).total_memory
-        # 4GB cards need a very safe margin (35% usage) to avoid fragmentation OOMs
-        ratio = 0.35 if vram_total < 5 * 1024**3 else 0.85
+        # Small GPUs (<4GB) need conservative margin to avoid fragmentation OOMs
+        ratio = 0.35 if vram_total < 5e9 else 0.85
         vram_limit = vram_total * ratio
     else:
-        vram_limit = available_ram * 0.15  # Fallback
+        vram_limit = available_ram * 0.15
 
-    # 40-120x is a range for 3D activation buffers.
-    if is_3d:
-        vram_multiplier = (
-            multiplier
-            if multiplier > 0
-            else (120.0 if vram_total < 5 * 1024**3 else 40.0)
+    # Determine VRAM multiplier for activation buffers (80-160x range for optimal GPU utilization)
+    # Modern GPUs can handle 128+ activations simultaneously without fragmentation
+    vram_multiplier = (
+        multiplier
+        if multiplier > 0
+        else (
+            160.0  # Aggressive but safe: allows full GPU utilization
+            if is_3d and vram_total >= 4e9
+            else (80.0 if is_3d else (60.0 if vram_total < 5e9 else 40.0))
         )
-    else:
-        vram_multiplier = (
-            multiplier
-            if multiplier > 0
-            else (30.0 if vram_total < 5 * 1024**3 else 20.0)
-        )
-
+    )
     target_pixels_vram = vram_limit / (4 * vram_multiplier)
 
-    # Resolve spatial indexes to correctly identify Z vs XY
+    # Identify spatial dimensions (excluding channel axis if present)
     spatial_indices = [i for i in range(len(shape)) if i != c_axis]
 
-    # Calculate scale factor for plane rescaling based on internal model diameters
-    model_diam = 17.0 if "nuclei" in str(model_type).lower() else 30.0
-
-    # SANITY CHECK: prevent absurdly small scale factors or huge min_dims from extreme diameters
-    # diameter=95000 leads to scale=0.0003, which makes side_vram_plane huge.
-    # We clamp the diameter used for blocksize logic to a reasonable range.
+    # Get model diameter: nuclei models use smaller internal diameters
+    model_diam = 17.0 if "nuclei" in model_type.lower() else 30.0
+    # Clamp diameter to reasonable range to prevent extreme scale factors
     calc_diameter = max(1.0, min(diameter, 500.0)) if diameter > 0 else model_diam
     scale = model_diam / calc_diameter
 
     if is_3d:
-        # Determine Z-axis length (first spatial index)
+        # For 3D: determine Z-axis target (first spatial dimension)
         z_len = shape[spatial_indices[0]] if len(spatial_indices) >= 3 else 1
+        # Adaptive Z-target: use larger blocks when RAM allows, cap at reasonable maximums
+        # This enables better GPU utilization while avoiding OOM on large volumes
+        z_ram_side = int(math.sqrt(target_voxels_ram / (spatial_side * spatial_side)))
+        z_target = min(z_len, max(128, min(512, z_ram_side)))
 
-        # Optimization: use one block for Z if it's small enough (avoid small remainders like 3 slices)
-        if z_len <= 128:
-            z_target = z_len
-        else:
-            z_target = min(64, z_len) if c_axis != 0 else 64
-
-        # Account for anisotropy in VRAM estimation. 3D mode runs XY, YZ, XZ planes.
-        # rescaled_plane_YZ = (z_target * scale * anisotropy) * (side * scale)
-        # rescaled_plane_XY = (side * scale) * (side * scale)
-        # We must limit the largest rescaled plane to target_pixels_vram.
-
-        # Max dimension scale factor across all axes
-        eff_anisotropy = max(1.0, anisotropy)
+        # Calculate max plane size constrained by VRAM for XY/YZ/XZ projections
+        eff_anisotropy = anisotropy if anisotropy > 1.0 else 1.0
         side_vram_plane = int(math.sqrt(target_pixels_vram / eff_anisotropy) / scale)
 
-        # NEW for 3D: Volume VRAM constraint for GPU post-processing
-        # Full-res volume must fit several times for flow-stitching on GPU.
-        # multiplier of 40-60x for 4GB cards to ensure the dynamics step fits.
-        vram_vol_multiplier = 60.0 if vram_total < 5 * 1024**3 else 10.0
+        # Volume VRAM constraint for GPU post-processing (flow-stitching dynamics step)
+        vram_vol_multiplier = 60.0 if vram_total < 5e9 else 10.0
         target_voxels_vram_vol = vram_limit / (4 * vram_vol_multiplier)
         side_vram_vol = int(math.sqrt(target_voxels_vram_vol / z_target))
 
-        # volume_voxels = (z * side * side) <= target_voxels_ram
+        # RAM constraint for volume storage
         side_ram = int(math.sqrt(target_voxels_ram / z_target))
 
+        # Take minimum of all constraints
         spatial_side = min(side_vram_plane, side_vram_vol, side_ram)
     else:
-        # For 2D
-        spatial_side = int(math.sqrt(target_pixels_vram) / scale)
-        # Match against total RAM volume too
-        spatial_side = min(spatial_side, int(math.sqrt(target_voxels_ram)))
+        # For 2D: constrain by VRAM plane size and total RAM volume
+        spatial_side = min(
+            int(math.sqrt(target_pixels_vram) / scale),
+            int(math.sqrt(target_voxels_ram)),
+        )
 
-    min_dim = int(round(3.0 * (calc_diameter if calc_diameter > 1 else 30.0)))
+    # Ensure block is at least 3x the model diameter (or 90px for small models)
+    min_dim = round(3.0 * (calc_diameter if calc_diameter > 1 else 30.0))
+    # Cap at reasonable maximums (4096 for 3D, 8192 for 2D)
     spatial_side = max(min_dim, min(4096 if is_3d else 8192, spatial_side))
 
-    # Hard cap for small cards to avoid fragmentation OOM
-    if vram_total > 0 and vram_total < 5 * 1024**3:
-        spatial_side = min(spatial_side, 512)
+    # Apply hard cap for small GPUs (<4GB) to avoid fragmentation OOMs
+    # Increased from 512 to 768 to match new aggressive multipliers
+    if vram_total > 0 and vram_total < 5e9:
+        spatial_side = min(spatial_side, 768)
 
+    # Build block shape: (Z, Y, X) for 3D or (Y, X) for 2D
     block3d = (
-        [z_target, spatial_side, spatial_side]
+        (z_target, spatial_side, spatial_side)
         if is_3d
-        else [spatial_side, spatial_side]
+        else (spatial_side, spatial_side)
     )
 
-    # Rank alignment based on shape and channel axis
-    # We want to keep the channel axis at 1 (one channel at a time)
-    # and map our 3D/2D block to the spatial dimensions.
+    # Map calculated block dimensions to spatial indices in the shape tuple
+    # We want to keep channel axis at 1 and map our block to spatial dims only
     final_block = list(shape)
-
-    # Map block3d dims (Z, Y, X) or (Y, X) to spatial indices in reverse (right to left)
     target_spatial_rank = len(block3d)
     for i, idx in enumerate(reversed(spatial_indices)):
         if i < target_spatial_rank:
-            # Match Z to Z, Y to Y, X to X regardless of exact dimension counts
+            # Match Z->Z, Y->Y, X->X regardless of total dimension count
             final_block[idx] = block3d[target_spatial_rank - 1 - i]
-        else:
-            # If spatial dims > 3, keep original for the rest
-            pass
 
-    # Ensure channel axis is 1 if it exists
+    # Safety check: ensure no dimension exceeds 50% of its image size
+    # This prevents crashes on edge cases (e.g., tiny images with aggressive multipliers)
+    safety_factor = 0.5
+    for dim_idx in range(len(final_block)):
+        if final_block[dim_idx] > int(safety_factor * shape[dim_idx]):
+            final_block[dim_idx] = min(
+                block3d[dim_idx], int(safety_factor * shape[dim_idx])
+            )
+
+    # Ensure channel axis has block size 1 (process one channel at a time)
     if c_axis is not None:
         final_block[c_axis] = 1
 
+    # Final clip to original shape dimensions and return as tuple
     return tuple(min(b, s) for b, s in zip(final_block, shape))
 
 
@@ -2240,7 +2234,7 @@ def dask_setup(worker):
                                     f"Re-opened OME-Zarr with blocksize {blocksize} chunks "
                                     f"(clean single-level task graph)"
                                 )
-                    except Exception:
+                    except Exception as e1:
                         pass
 
                     # ── Strategy 2: re-open 3-D converted zarr ──
@@ -2258,7 +2252,7 @@ def dask_setup(worker):
                                         f"Re-opened converted zarr with blocksize {blocksize} "
                                         f"chunks (clean single-level task graph)"
                                     )
-                        except Exception:
+                        except Exception as e2:
                             pass
 
                     # ── Strategy 3: fall back to dask rechunk ──
@@ -2268,7 +2262,12 @@ def dask_setup(worker):
                             f"(zarr re-open unavailable; graph may be large)..."
                         )
                         sys.stdout.flush()
-                        input_zarr = input_zarr.rechunk(blocksize)
+                        try:
+                            input_zarr = input_zarr.rechunk(blocksize)
+                        except Exception as e3:
+                            print(
+                                f"Warning: rechunk fallback also failed ({e3}), proceeding with native chunks"
+                            )
 
             except Exception as _rce:
                 print(
