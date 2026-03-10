@@ -18,7 +18,6 @@ import logging
 import math
 import multiprocessing
 import os
-import random
 import shutil
 import socket
 import subprocess
@@ -1327,6 +1326,15 @@ def get_auto_blocksize(
     if is_3d:
         # For 3D: determine Z-axis target (first spatial dimension)
         z_len = shape[spatial_indices[0]] if len(spatial_indices) >= 3 else 1
+
+        # Initialize spatial_side for 3D case before calculations
+        # Handle non-standard 3D shapes (e.g., line scans, custom geometries)
+        if len(spatial_indices) < 3:
+            spatial_side = int(math.sqrt(target_voxels_ram))
+        else:
+            # Standard 3D with at least 3 spatial dimensions
+            spatial_side = int(math.sqrt(target_pixels_vram / scale))
+
         # Adaptive Z-target: use larger blocks when RAM allows, cap at reasonable maximums
         # This enables better GPU utilization while avoiding OOM on large volumes
         z_ram_side = int(math.sqrt(target_voxels_ram / (spatial_side * spatial_side)))
@@ -2234,7 +2242,7 @@ def dask_setup(worker):
                                     f"Re-opened OME-Zarr with blocksize {blocksize} chunks "
                                     f"(clean single-level task graph)"
                                 )
-                    except Exception as e1:
+                    except Exception:
                         pass
 
                     # ── Strategy 2: re-open 3-D converted zarr ──
@@ -2252,7 +2260,7 @@ def dask_setup(worker):
                                         f"Re-opened converted zarr with blocksize {blocksize} "
                                         f"chunks (clean single-level task graph)"
                                     )
-                        except Exception as e2:
+                        except Exception:
                             pass
 
                     # ── Strategy 3: fall back to dask rechunk ──

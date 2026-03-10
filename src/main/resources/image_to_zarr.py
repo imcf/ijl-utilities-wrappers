@@ -37,6 +37,7 @@ import argparse
 import contextlib
 import gc
 import itertools
+import logging
 import os
 import sys
 import time
@@ -47,6 +48,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import dask.array as da
 import numpy as np
 import zarr
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Detect Zarr version to handle V3 vs V2 differences
 ZARR_V3 = zarr.__version__.startswith("3")
@@ -112,7 +116,7 @@ def _auto_chunks(dtype: np.dtype, z_size: int = 0) -> Tuple[int, int, int, int]:
     else:
         # Fall back to 8 GB when psutil is not installed.
         free_bytes = 8 * 1024**3
-        print("  (psutil not found - assuming 8 GB free RAM for shard sizing)")
+        logger.info("  (psutil not found - assuming 8 GB free RAM for shard sizing)")
 
     bytes_per_elem = np.dtype(dtype).itemsize
     # Target: 10 % of free RAM per shard, hard-capped at 1 GB.
@@ -136,7 +140,7 @@ def _auto_chunks(dtype: np.dtype, z_size: int = 0) -> Tuple[int, int, int, int]:
     xy_tile = int(2 ** int(np.log2(max(xy_budget**0.5, 1))))
     xy_tile = max(256, min(xy_tile, 8192))  # clamp to [256, 8192]
 
-    print(
+    logger.info(
         f"  Auto shard size: (1, {z_chunk}, {xy_tile}, {xy_tile}) "
         f"≈ {z_chunk * xy_tile * xy_tile * bytes_per_elem / 1024**2:.0f} MB/shard "
         f"[{free_bytes / 1024**3:.1f} GB free RAM]"
@@ -205,26 +209,32 @@ def _write_to_zarr_with_progress(
     else:
         pbar_ctx = contextlib.nullcontext()
 
-    # Sequential read in main thread + 1 background writer.
-    # Write traffic is negligible after LZ4; keeping reads sequential avoids
-    # h5py / BioIO thread-safety issues with concurrent access.
-    with pbar_ctx as pbar, ThreadPoolExecutor(max_workers=1) as write_exec:
-        write_future = None
+    # Sequential read + 4 parallel writers with batching.
+    # Batch writes reduce thread overhead while avoiding h5py thread-safety issues.
+    # Each writer processes a batch of shards before blocking, improving throughput.
+    BATCH_SIZE = 2
+    with pbar_ctx as pbar, ThreadPoolExecutor(max_workers=4) as write_exec:
+        futures = []
         for coord in shard_coords:
             slc = _slc(coord)
             block = dask_arr[slc].compute()
-            if write_future is not None:
-                write_future.result()
+            future = write_exec.submit(z_arr.__setitem__, slc, block)
+            futures.append(future)
+            del block
+            # Process batch to keep pipeline full without overwhelming h5py
+            if len(futures) >= BATCH_SIZE:
+                for f in futures[:BATCH_SIZE]:
+                    f.result()
+                futures = futures[BATCH_SIZE:]
                 gc.collect()
                 if tqdm is not None and pbar is not None:
-                    pbar.update(1)
-            write_future = write_exec.submit(z_arr.__setitem__, slc, block)
-            del block
-        if write_future is not None:
-            write_future.result()
-            gc.collect()
-            if tqdm is not None and pbar is not None:
-                pbar.update(1)
+                    pbar.update(BATCH_SIZE)
+        # Flush remaining futures
+        for f in futures:
+            f.result()
+        gc.collect()
+        if tqdm is not None and pbar is not None:
+            pbar.update(len(futures))
 
 
 def _clamp_chunks(chunks: Tuple[int, ...], shape: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -342,7 +352,7 @@ def _open_shard_array(
                 ],
             )
         ]
-        print(f"    shard={chunks}  inner={inner}  codec=lz4")
+    logger.info(f"    shard={chunks}  inner={inner}  codec=lz4")
     return zarr.open_array(out_dir, **kwargs)
 
 
@@ -597,11 +607,11 @@ def convert_ims_to_zarr(
         True if the conversion was successful, False otherwise.
     """
     if h5py is None:
-        print("Error: h5py is required for Imaris conversion.")
+        logger.error("Error: h5py is required for Imaris conversion.")
         return False
 
     try:
-        print(f"Opening Imaris file with h5py: {input_path}")
+        logger.info(f"Opening Imaris file with h5py: {input_path}")
         start_time = time.time()
         # Large chunk cache reduces SMB round-trips: HDF5 sub-chunks are
         # fetched in bigger batches rather than one request per chunk.
@@ -632,7 +642,7 @@ def convert_ims_to_zarr(
         for res_level, res_key in enumerate(res_keys):
             res_group = f[f"/DataSet/{res_key}"]
             if t_key not in res_group:
-                print(f"  Skipping {res_key}, {t_key} not found.")
+                logger.info(f"  Skipping {res_key}, {t_key} not found.")
                 continue
 
             # Find all channel keys for this timepoint
@@ -642,7 +652,7 @@ def convert_ims_to_zarr(
             )
 
             if not c_keys:
-                print(f"  Skipping {res_key}, no channels found.")
+                logger.info(f"  Skipping {res_key}, no channels found.")
                 continue
 
             # Collect raw h5py datasets (one per channel).
@@ -654,7 +664,7 @@ def convert_ims_to_zarr(
             dummy = da.empty(czyx_shape, dtype=sample_ds.dtype)
             _, final_chunks = _resolve_chunks(dummy, target_chunks)
 
-            print(f"  Level {res_level}: shape={czyx_shape}")
+            logger.info(f"  Level {res_level}: shape={czyx_shape}")
             z_arr = _open_shard_array(
                 os.path.join(output_path, str(res_level)),
                 czyx_shape,
@@ -691,10 +701,10 @@ def convert_ims_to_zarr(
 
         _write_omengff_metadata(root, datasets, pz, py, px)
 
-        print(f"Conversion done in {time.time() - start_time:.1f}s")
+        logger.info(f"Conversion done in {time.time() - start_time:.1f}s")
         return True
     except Exception as e:
-        print(f"Imaris conversion failed: {e}")
+        logger.error(f"Imaris conversion failed: {e}")
         traceback.print_exc()
         return False
 
@@ -729,11 +739,11 @@ def convert_bioio_to_zarr(
         True if the conversion was successful, False otherwise.
     """
     if BioImage is None:
-        print("Error: BioIO is required for this file format.")
+        logger.error("Error: BioIO is required for this file format.")
         return False
 
     try:
-        print(f"Opening file with BioIO: {input_path}")
+        logger.info(f"Opening file with BioIO: {input_path}")
         start_time = time.time()
         img = BioImage(input_path)
         data = img.data  # Usually (T, C, Z, Y, X)
@@ -767,7 +777,7 @@ def convert_bioio_to_zarr(
         try:
             pp = img.physical_pixel_sizes
             pz, py, px = pp.Z or 1.0, pp.Y or 1.0, pp.X or 1.0
-            print(f"  Detected calibration: {pz:.4f}, {py:.4f}, {px:.4f} um")
+            logger.info(f"  Detected calibration: {pz:.4f}, {py:.4f}, {px:.4f} um")
         except Exception:
             pass
 
@@ -794,7 +804,7 @@ def convert_bioio_to_zarr(
 
             level_data, level_chunks = _resolve_chunks(level_data, target_chunks)
 
-            print(f"  Level {level}: shape={level_data.shape}")
+            logger.info(f"  Level {level}: shape={level_data.shape}")
             z_arr = _open_shard_array(
                 os.path.join(output_path, str(level)),
                 level_data.shape,
@@ -814,10 +824,10 @@ def convert_bioio_to_zarr(
 
         _write_omengff_metadata(root, datasets, pz, py, px)
 
-        print(f"Conversion done in {time.time() - start_time:.1f}s")
+        logger.info(f"Conversion done in {time.time() - start_time:.1f}s")
         return True
     except Exception as e:
-        print(f"BioIO conversion failed: {e}")
+        logger.error(f"BioIO conversion failed: {e}")
         traceback.print_exc()
         return False
 
