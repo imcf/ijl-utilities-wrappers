@@ -402,6 +402,33 @@ def setup_worker(nthreads: int, min_intensity: Optional[float] = None) -> Any:
         except Exception:
             pass
 
+        # Hardware acceleration optimizations (Universally Safe)
+        # These flags are designed to speed up capable GPUs and silently fall back on others.
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                # 1. Benchmark MODE: Works on all NVIDIA GPUs. Auto-tunes convolutions for the given block size.
+                if hasattr(torch.backends, "cudnn"):
+                    torch.backends.cudnn.benchmark = True
+
+                # 2. TF32 (TensorFloat-32): Works on Ampere/Ada (e.g. A6000, 30xx, 40xx).
+                # PyTorch is explicitly designed to silently ignore these flags and fall back to
+                # standard FP32 if the hardware doesn't support it (e.g., Turing/Pascal or older).
+                if hasattr(torch.backends, "cudnn") and hasattr(
+                    torch.backends.cudnn, "allow_tf32"
+                ):
+                    torch.backends.cudnn.allow_tf32 = True
+
+                if hasattr(torch.backends, "cuda") and hasattr(
+                    torch.backends.cuda, "matmul"
+                ):
+                    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+                        torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            # Silently pass on CPUs, AMD machines, or very old PyTorch versions to guarantee pipeline portability.
+            pass
+
         # Suppress cellpose's internal logger setup in workers to avoid
         # PermissionError when multiple workers try to open the same log file.
         # This is especially important on Windows.
@@ -421,13 +448,20 @@ def setup_worker(nthreads: int, min_intensity: Optional[float] = None) -> Any:
         except Exception as e:
             print(f"setup_worker: apply_zarr_patches failed: {e}")
 
-        # OPTIMIZATION: Early-exit Network skip for empty blocks
+        # OPTIMIZATION: Early-exit Network skip for empty blocks and I/O pipelining
         # Patch CellposeModel.eval to skip the network if mean intensity is too low
+        # AND enforce a Thread Lock to allow Dask to prefetch I/O in parallel threads
+        # without crashing the GPU with concurrent workloads.
         try:
             from cellpose.models import CellposeModel
 
             if not hasattr(CellposeModel.eval, "_patched_for_skip"):
                 _orig_eval = CellposeModel.eval
+                import threading
+
+                # Create a lock bound to the worker process instance
+                # All Dask threads in this worker will share this lock.
+                gpu_process_lock = threading.Lock()
 
                 def _eval_with_skip(self, x, *args, **kwargs):
                     # Check if the input block should be skipped based on intensity
@@ -470,7 +504,10 @@ def setup_worker(nthreads: int, min_intensity: Optional[float] = None) -> Any:
                     except Exception as e_skip:
                         print(f"Warning: early intensity check failed ({e_skip})")
 
-                    return _orig_eval(self, x, *args, **kwargs)
+                    # Compute with GPU Thread Lock
+                    # The worker's other threads can handle networking unblocked!
+                    with gpu_process_lock:
+                        return _orig_eval(self, x, *args, **kwargs)
 
                 # Tag and replace
                 _eval_with_skip._patched_for_skip = True
