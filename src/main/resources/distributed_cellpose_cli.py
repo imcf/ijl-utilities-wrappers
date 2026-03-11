@@ -627,12 +627,16 @@ def _get_array_stats(
                     slc[idx] = random.randint(0, shape[idx] - 1)
 
                 s = da_array[tuple(slc)]
+                samples.append(s)
 
-                if hasattr(s, "compute"):
-                    s = s.compute()
-                samples.append(np.asanyarray(s).flatten())
+            if samples and hasattr(samples[0], "compute"):
+                import dask
 
-            sample = np.concatenate(samples)
+                samples = dask.compute(*samples)
+
+            # Flatten and concatenate
+            flat_samples = [np.asanyarray(s).flatten() for s in samples]
+            sample = np.concatenate(flat_samples)
         else:
             # Original striding logic for smaller arrays or if nbytes unavailable
             # First, filter to channel if provided
@@ -648,16 +652,91 @@ def _get_array_stats(
 
             if sample_ratio > 1:
                 print(f"  Sampling 1/{sample_ratio} pixels for statistics...")
+
+                import math
+
                 if ndim == 3:
                     z_stride = 2 if shape[0] > 10 else 1
-                    xy_stride = int(math.sqrt(sample_ratio / z_stride))
-                    sample = da_array[::z_stride, ::xy_stride, ::xy_stride]
+                    xy_stride = max(1, int(math.sqrt(sample_ratio / z_stride)))
+                    slc_samp = (
+                        slice(None, None, z_stride),
+                        slice(None, None, xy_stride),
+                        slice(None, None, xy_stride),
+                    )
                 elif ndim == 4:
                     z_stride = 2 if shape[1] > 10 else 1
-                    xy_stride = int(math.sqrt(sample_ratio / z_stride))
-                    sample = da_array[:, ::z_stride, ::xy_stride, ::xy_stride]
+                    xy_stride = max(1, int(math.sqrt(sample_ratio / z_stride)))
+                    slc_samp = (
+                        slice(None),
+                        slice(None, None, z_stride),
+                        slice(None, None, xy_stride),
+                        slice(None, None, xy_stride),
+                    )
                 else:
-                    sample = da_array.flatten()[::sample_ratio]
+                    z_stride, xy_stride = 1, sample_ratio
+                    slc_samp = (slice(None, None, sample_ratio),)
+
+                if hasattr(da_array, "compute"):
+                    # Use map_blocks to avoid massive task graphs from sliced getitem
+                    def _ds_samp(b):
+                        if b.ndim in (3, 4):
+                            return b[slc_samp]
+                        return b.flatten()[::sample_ratio]
+
+                    try:
+                        if ndim == 3:
+                            ds_ch = (
+                                tuple(
+                                    max(1, math.ceil(c / z_stride))
+                                    for c in da_array.chunks[0]
+                                ),
+                                tuple(
+                                    max(1, math.ceil(c / xy_stride))
+                                    for c in da_array.chunks[1]
+                                ),
+                                tuple(
+                                    max(1, math.ceil(c / xy_stride))
+                                    for c in da_array.chunks[2]
+                                ),
+                            )
+                        elif ndim == 4:
+                            ds_ch = (
+                                da_array.chunks[0],
+                                tuple(
+                                    max(1, math.ceil(c / z_stride))
+                                    for c in da_array.chunks[1]
+                                ),
+                                tuple(
+                                    max(1, math.ceil(c / xy_stride))
+                                    for c in da_array.chunks[2]
+                                ),
+                                tuple(
+                                    max(1, math.ceil(c / xy_stride))
+                                    for c in da_array.chunks[3]
+                                ),
+                            )
+                        else:
+                            ds_ch = (
+                                tuple(
+                                    max(1, math.ceil(c / sample_ratio))
+                                    for c in da_array.chunks[0]
+                                ),
+                            )
+
+                        sample = da_array.map_blocks(
+                            _ds_samp, dtype=da_array.dtype, chunks=ds_ch
+                        )
+                    except Exception:
+                        # Fallback
+                        if ndim in (3, 4):
+                            sample = da_array[slc_samp]
+                        else:
+                            sample = da_array.flatten()[::sample_ratio]
+                else:
+                    if ndim in (3, 4):
+                        sample = da_array[slc_samp]
+                    else:
+                        sample = da_array.flatten()[::sample_ratio]
 
                 if hasattr(sample, "compute"):
                     sample = sample.compute()
@@ -699,9 +778,29 @@ def _get_array_stats(
             )
             # For dask/zarr, try to apply stride before computing
             try:
-                if len(safe_da.shape) >= 2:
-                    slc_safe = [slice(None, None, safety_stride)] * safe_da.ndim
-                    safe_da = safe_da[tuple(slc_safe)]
+                if hasattr(safe_da, "compute"):
+                    # Avoid Dask HLG hang by using map_blocks to stride chunks
+                    def _ds_safe(b):
+                        return b[
+                            tuple(slice(None, None, safety_stride) for _ in b.shape)
+                        ]
+
+                    try:
+                        import math
+
+                        ds_ch = tuple(
+                            tuple(max(1, math.ceil(c / safety_stride)) for c in ch)
+                            for ch in safe_da.chunks
+                        )
+                        safe_da = safe_da.map_blocks(
+                            _ds_safe, dtype=safe_da.dtype, chunks=ds_ch
+                        )
+                    except Exception:
+                        pass
+                else:
+                    if len(safe_da.shape) >= 2:
+                        slc_safe = [slice(None, None, safety_stride)] * safe_da.ndim
+                        safe_da = safe_da[tuple(slc_safe)]
             except Exception:
                 pass
 
@@ -883,8 +982,17 @@ def _create_optimized_segmentation_mask(
                 if i != c_axis:
                     slc_m[i] = slice(None, None, stride)
 
-            # Zarr slicing with step is efficient (doesn't load everything)
-            da_mask_src = da.from_array(z_mask[tuple(slc_m)], chunks="auto")
+            # Let Dask handle the slicing lazily instead of synchronous Zarr loads
+            da_z_mask = da.from_array(z_mask, chunks="auto")
+            import string
+
+            try:
+                # Dask handles channel indexing and slicing optimally without blocking
+                da_mask_src = da_z_mask[tuple(slc_m)]
+            except Exception:
+                # Fallback to direct slice
+                da_mask_src = da.from_array(z_mask[tuple(slc_m)], chunks="auto")
+
         else:
             # Standard path: wrap in dask and slice channel lazily
             da_mask_src = da.from_array(z_mask, chunks="auto")
@@ -1123,10 +1231,15 @@ def get_optimal_n_workers(
         n_workers = min(eff_requested_workers, n_workers_gpu, max_workers_ram)
 
         # Internal threads: each worker can use multiple cores for pre/post-processing
-        # but we set Dask threads to 1 to ensure blocks are processed sequentially per GPU.
         internal_threads = min(16, max(1, total_cpus // max(1, n_workers)))
 
-        return max(0, n_workers), 1, internal_threads
+        # Dask threads: Use significantly more threads per worker (up to 12) for aggressive network I/O pipelining.
+        # Since we use 3D blocks over SMB/network, latency completely kills performance without deep prefetching.
+        # The worker_patches.py Thread Lock ensures blocks still evaluate sequentially on the GPU,
+        # completely preventing VRAM crashes while hiding network latency!
+        dask_threads = min(12, max(4, total_cpus // max(1, n_workers)))
+
+        return max(0, n_workers), dask_threads, internal_threads
 
     except Exception as e:
         print(
@@ -2222,28 +2335,118 @@ def dask_setup(worker):
                 if needs_clean:
                     _created_clean = False
 
-                    # ── Strategy 1: re-open OME-Zarr level-0 with blocksize chunks ──
-                    # Produces a clean graph: 1 task per spatial block.
-                    try:
-                        _ch_idx = (args.chan - 1) if getattr(args, "chan", 0) > 0 else 0
-                        _zarr_path = getattr(args, "input_file", None)
-                        if _zarr_path and os.path.exists(_zarr_path):
-                            _clean = da.from_zarr(
-                                _zarr_path,
-                                component="0",
-                                chunks=(1,) + tuple(blocksize),
-                            )
-                            if _clean.ndim == 4:
-                                _clean = _clean[_ch_idx]
-                            if _clean.shape == input_zarr.shape:
-                                input_zarr = _clean
-                                _created_clean = True
-                                print(
-                                    f"Re-opened OME-Zarr with blocksize {blocksize} chunks "
-                                    f"(clean single-level task graph)"
+                    # ── Strategy 0.5: Force cache slow graph to local SSD Zarr ──
+                    # If we are mapping over a network or combining channels, random getitem
+                    # calls will bottleneck the entire GPU. Streaming once sequentially to locally chunked NVMe
+                    # Zarr perfectly solves all IO deadlocks! Use exclusively during 'optimize_parallel'.
+                    if getattr(args, "optimize_parallel", False):
+                        try:
+                            _tmp_dir = getattr(args, "temporary_directory", None)
+                            if _tmp_dir:
+                                import uuid
+
+                                import numpy as np
+
+                                # Safety: Only cache if smaller than 50GB to avoid filling drives
+                                # Images over 50GB skip caching to avoid massive upfront wait times unless requested.
+                                _item_size = (
+                                    getattr(input_zarr.dtype, "itemsize", 2)
+                                    if hasattr(input_zarr, "dtype")
+                                    else 2
                                 )
-                    except Exception:
-                        pass
+                                _size_limit_bytes = 50 * 1024**3
+
+                                _shape = getattr(input_zarr, "shape", None)
+                                if _shape is not None:
+                                    _image_size_bytes = (
+                                        float(np.prod(_shape)) * _item_size
+                                    )
+
+                                    # Very heuristic check: if input file isn't already on the exact same mounted drive as tmp
+                                    _input_path = getattr(
+                                        args,
+                                        "input_file",
+                                        getattr(args, "input_dir", ""),
+                                    )
+                                    _is_diff_drive = True
+                                    if _input_path:
+                                        try:
+                                            _is_diff_drive = (
+                                                os.path.splitdrive(
+                                                    os.path.abspath(_input_path)
+                                                )[0]
+                                                != os.path.splitdrive(
+                                                    os.path.abspath(_tmp_dir)
+                                                )[0]
+                                            )
+                                        except Exception:
+                                            pass
+
+                                    # If image is small enough perfectly cache it!
+                                    if (
+                                        _image_size_bytes > 0
+                                        and _image_size_bytes < _size_limit_bytes
+                                        and _is_diff_drive
+                                    ):
+                                        _cache_path = os.path.join(
+                                            _tmp_dir,
+                                            f"fast_io_cache_{uuid.uuid4().hex}.zarr",
+                                        )
+                                        print(
+                                            f"Creating Local SSD IO Cache ({(_image_size_bytes / 1024**3):.1f} GB) to perfectly align blocks and "
+                                            f"eliminate network delays... ({_cache_path})"
+                                        )
+                                        sys.stdout.flush()
+
+                                        _input_da = (
+                                            input_zarr
+                                            if hasattr(input_zarr, "compute")
+                                            else da.from_array(
+                                                input_zarr, chunks="auto"
+                                            )
+                                        )
+                                        # Write using multi-threaded stream directly to SSD
+                                        _input_da.rechunk(blocksize).to_zarr(
+                                            _cache_path, overwrite=True
+                                        )
+
+                                        # Reload cleanly from local disk wrapper
+                                        _clean = da.from_zarr(_cache_path)
+                                        if _clean.shape == input_zarr.shape:
+                                            input_zarr = _clean
+                                            _created_clean = True
+                                            print(
+                                                f"Network Cache complete. Using pure local NVMe chunks ({blocksize})!"
+                                            )
+                        except Exception as cache_err:
+                            print(
+                                f"Warning: Local caching strategy failed ({cache_err}). Reverting to live network reads."
+                            )
+
+                    # ── Strategy 1: re-open OME-Zarr level-0 with blocksize chunks ──
+                    if not _created_clean:
+                        try:
+                            _ch_idx = (
+                                (args.chan - 1) if getattr(args, "chan", 0) > 0 else 0
+                            )
+                            _zarr_path = getattr(args, "input_file", None)
+                            if _zarr_path and os.path.exists(_zarr_path):
+                                _clean = da.from_zarr(
+                                    _zarr_path,
+                                    component="0",
+                                    chunks=(1,) + tuple(blocksize),
+                                )
+                                if _clean.ndim == 4:
+                                    _clean = _clean[_ch_idx]
+                                if _clean.shape == input_zarr.shape:
+                                    input_zarr = _clean
+                                    _created_clean = True
+                                    print(
+                                        f"Re-opened OME-Zarr with blocksize {blocksize} chunks "
+                                        f"(clean single-level task graph)"
+                                    )
+                        except Exception:
+                            pass
 
                     # ── Strategy 2: re-open 3-D converted zarr ──
                     if not _created_clean:
@@ -2265,23 +2468,48 @@ def dask_setup(worker):
 
                     # ── Strategy 3: fall back to dask rechunk ──
                     if not _created_clean:
-                        print(
-                            f"Rechunking input to blocksize {blocksize} "
-                            f"(zarr re-open unavailable; graph may be large)..."
-                        )
-                        sys.stdout.flush()
-                        try:
-                            input_zarr = input_zarr.rechunk(blocksize)
-                        except Exception as e3:
+                        if hasattr(input_zarr, "dask"):
                             print(
-                                f"Warning: rechunk fallback also failed ({e3}), proceeding with native chunks"
+                                f"Rechunking input to blocksize {blocksize} "
+                                f"(zarr re-open unavailable; graph may be large)..."
                             )
+                            sys.stdout.flush()
+                            try:
+                                input_zarr = input_zarr.rechunk(blocksize)
+                            except Exception as e3:
+                                print(
+                                    f"Warning: rechunk fallback failed ({e3}), proceeding with native chunks"
+                                )
+                        else:
+                            # Array-like fallback (like our ZarrChannelSubset)
+                            print(
+                                f"Wrapping array-like object with blocksize {blocksize}"
+                            )
+                            try:
+                                input_zarr = da.from_array(
+                                    input_zarr, chunks=tuple(blocksize)
+                                )
+                            except Exception as e4:
+                                print(f"Warning: from_array fallback failed ({e4})")
 
             except Exception as _rce:
                 print(
                     f"Warning: clean graph setup failed ({_rce}), proceeding with native chunks"
                 )
             sys.stdout.flush()
+
+        # Clean channel_zarrs as well, using from_array to ensure clean graphs
+        if channel_zarrs is not None and blocksize is not None:
+            cleaned_cz = []
+            for i, cz in enumerate(channel_zarrs):
+                if not hasattr(cz, "dask"):
+                    try:
+                        print(f"Wrapping channel_zarrs[{i}] with blocksize {blocksize}")
+                        cz = da.from_array(cz, chunks=tuple(blocksize))
+                    except Exception:
+                        pass
+                cleaned_cz.append(cz)
+            channel_zarrs = cleaned_cz
 
         print("Starting distributed_eval - cluster initialization may take a minute...")
         sys.stdout.flush()
@@ -2799,6 +3027,36 @@ def dask_setup(worker):
                 pass
 
 
+class ZarrChannelSubset:
+    """Wrapper to lazy-slice a channel from a generic Array-like without triggering a Dask HLG explosion."""
+
+    def __init__(self, arr, c_axis, c_idx):
+        self.arr = arr
+        self.c_axis = c_axis
+        self.c_idx = c_idx
+        # Calculate new shape (drop the channel axis)
+        s = list(arr.shape)
+        s.pop(c_axis)
+        self.shape = tuple(s)
+        self.dtype = arr.dtype
+        self.ndim = arr.ndim - 1
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+
+        if key == slice(None):
+            key = (slice(None),) * self.ndim
+
+        # Pad with slice(None) if key is too short
+        if len(key) < self.ndim:
+            key = tuple(key) + (slice(None),) * (self.ndim - len(key))
+
+        new_key = list(key)
+        new_key.insert(self.c_axis, self.c_idx)
+        return self.arr[tuple(new_key)]
+
+
 def main():
     """Command-line entry point for the Cellpose Distributed helper.
 
@@ -2815,11 +3073,16 @@ def main():
     if dask is not None:
         dask.config.set(
             {
-                "distributed.worker.memory.target": 0.85,
-                "distributed.worker.memory.spill": 0.90,
-                "distributed.worker.memory.pause": 0.95,
+                # Allow heavily pipelined background I/O prefetching to keep the GPU fed
+                "distributed.worker.memory.target": False,  # Stop early spilling
+                "distributed.worker.memory.spill": 0.85,
+                "distributed.worker.memory.pause": 0.90,
                 "distributed.worker.memory.terminate": 0.98,
                 "array.slicing.split_large_chunks": True,
+                # Increase network block timeout limits
+                "distributed.comm.timeouts.connect": "120s",
+                "distributed.comm.timeouts.tcp": "120s",
+                "optimization.fuse.active": True,
             }
         )
 
@@ -3284,7 +3547,7 @@ def main():
                     raise ValueError(f"Could not load an array from {args.input_file}")
 
                 if hasattr(im, "dtype"):  # It's a zarr array
-                    im_da = da.from_zarr(im)
+                    im_da = im
                 else:  # It's already a dask array from from_zarr above
                     im_da = im
 
@@ -3307,13 +3570,31 @@ def main():
                         if c2_idx != c1_idx:
                             needed_indices.append(c2_idx)
 
-                    if len(needed_indices) == 1:
-                        input_zarr = im_da[needed_indices[0]]
+                    print(
+                        f"Subsetting/Stacking mode: mapping channels to stack indices {needed_indices}"
+                    )
+
+                    channel_arrays = []
+                    for idx in needed_indices:
+                        if hasattr(im_da, "dask"):
+                            # Handle natively if it was already a generic dask array
+                            slc = [slice(None)] * im_da.ndim
+                            slc[c_axis_pos] = slice(idx, idx + 1)
+                            channel_arrays.append(
+                                da.squeeze(im_da[tuple(slc)], axis=c_axis_pos)
+                            )
+                        else:
+                            # Use lightweight wrapper for native Zarr to avoid HLG explosions
+                            channel_arrays.append(
+                                ZarrChannelSubset(im_da, c_axis_pos, idx)
+                            )
+
+                    if len(channel_arrays) == 1:
+                        input_zarr = channel_arrays[0]
                         c_axis_pos = None
                     else:
-                        input_zarr = da.stack(
-                            [im_da[idx] for idx in needed_indices], axis=0
-                        )
+                        input_zarr = channel_arrays[0]
+                        channel_zarrs = channel_arrays[1:]
                         c_axis_pos = 0
                 else:
                     input_zarr = im_da
@@ -4155,8 +4436,10 @@ def main():
                 )
                 sys.stdout.flush()
 
-                # If we don't have a mask yet (e.g. not a Zarr or was missing pyramids), generate it.
-                if segmentation_mask is None:
+                # If we don't have a mask yet and it's not explicitly skipped, generate it.
+                if segmentation_mask is None and not (
+                    image_size_bytes > size_limit_for_mask
+                ):
                     # For reasonable image sizes (<500MP), we can hold the whole boolean mask in RAM.
                     # Thresholding directly at full-res avoids misalignment issues.
                     total_pixels = np.prod(input_zarr.shape)
@@ -4175,9 +4458,33 @@ def main():
                         slices = tuple(
                             slice(None, None, ds_factor) for _ in input_zarr.shape
                         )
-                        segmentation_mask = (
-                            np.array(input_zarr[slices]) > args.min_intensity
-                        )
+
+                        if hasattr(input_zarr, "compute"):
+                            # Avoid Dask's HLG string of slice getitem bugs by mapping blocks
+                            def _ds_block(b):
+                                b_slc = tuple(
+                                    slice(None, None, ds_factor) for _ in b.shape
+                                )
+                                return b[b_slc] > args.min_intensity
+
+                            try:
+                                ds_chunks = tuple(
+                                    tuple(max(1, math.ceil(c / ds_factor)) for c in ch)
+                                    for ch in input_zarr.chunks
+                                )
+                                seg_mask_da = input_zarr.map_blocks(
+                                    _ds_block, dtype=bool, chunks=ds_chunks
+                                )
+                                segmentation_mask = seg_mask_da.compute()
+                            except Exception:
+                                # Fallback if chunks are missing or something
+                                segmentation_mask = (
+                                    np.array(input_zarr[slices]) > args.min_intensity
+                                )
+                        else:
+                            segmentation_mask = (
+                                np.array(input_zarr[slices]) > args.min_intensity
+                            )
 
                 # Dilate mask to include cell tails and buffer at block boundaries.
                 # This ensures neighboring chunks are processed for robust stitching.
@@ -4208,8 +4515,44 @@ def main():
                             mask_np = np.asanyarray(segmentation_mask)
 
                         mask_np = _dilate_mask(mask_np, iterations=num_iter)
-                        # Put back into dask for distributed_eval to handle mapping
-                        segmentation_mask = da.from_array(mask_np, chunks=mask_np.shape)
+
+                        import tempfile
+                        import uuid
+
+                        temp_mask_dir = (
+                            args.temporary_directory
+                            if hasattr(args, "temporary_directory")
+                            and args.temporary_directory
+                            else tempfile.gettempdir()
+                        )
+                        temp_mask_path = os.path.join(
+                            temp_mask_dir, f"temp_mask_{uuid.uuid4().hex}.zarr"
+                        )
+
+                        try:
+                            # Save to a temporary Zarr directory so Dask does not try to encode
+                            # the massive boolean array literally into the task graph.
+                            # Ensure clean chunk boundaries aligned to roughly 256MB bounds
+                            z_mask_out = zarr.open(
+                                temp_mask_path,
+                                mode="w",
+                                shape=mask_np.shape,
+                                chunks=True,
+                                dtype=bool,
+                            )
+                            z_mask_out[...] = mask_np
+
+                            # Put back into dask mapping from the file layout directly
+                            segmentation_mask = da.from_zarr(temp_mask_path)
+                            print(
+                                f"Saved Early Exit mask to disk at {temp_mask_path} to prevent Dask graph bloat."
+                            )
+                        except Exception as e:
+                            print(
+                                f"Warning: could not save early mask to disk: {e}. Falling back to ram projection..."
+                            )
+                            segmentation_mask = da.from_array(mask_np, chunks="auto")
+
                     except Exception as de:
                         print(f"Warning: mask dilation failed ({de})")
                         print(f"Warning: dilation failed: {de}")
